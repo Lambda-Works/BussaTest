@@ -1,0 +1,22 @@
+{
+  "name": "bussatest",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.24.0",
+  "description": "Monorepo — Next.js + NestJS + PostgreSQL, deployable en Lambda Hub",
+  "scripts": {
+    "start": "echo '❌ This project runs in Docker. Use: docker compose -f docker-compose.prod.yml up --build' && exit 1",
+    "dev": "echo '❌ This project runs in Docker. Use: docker compose up --build' && exit 1",
+    "build": "echo '❌ This project runs in Docker. Use: docker compose -f docker-compose.prod.yml up --build' && exit 1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@prisma/client",
+      "@prisma/engines",
+      "prisma"
+    ]
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
