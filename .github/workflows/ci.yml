@@ -1,0 +1,17 @@
+# CI compartido de LambdaWorks (MAX-294): lint, typecheck, build, test y gitleaks.
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: Lambda-Works/.github/.github/workflows/ci.yml@main
+    with:
+      node-version: "22"
+      pre-build-command: pnpm --filter ./apps/api exec prisma generate
+      build-command: pnpm --filter "./apps/**" --if-present run build
