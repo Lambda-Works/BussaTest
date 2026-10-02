@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   ci:
-    uses: Lambda-Works/.github/.github/workflows/ci.yml@main
+    uses: ./.github/workflows/ci-shared.yml
     with:
       node-version: "22"
       pre-build-command: pnpm --filter ./apps/api exec prisma generate
