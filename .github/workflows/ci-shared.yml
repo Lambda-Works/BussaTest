@@ -1,0 +1,231 @@
+# Copia del workflow reutilizable de Lambda-Works/.github: este repo es publico y GitHub no
+# permite que un repo publico llame a workflows de un repo privado. Mantener sincronizada.
+# CI reutilizable de LambdaWorks (MAX-294 / MAX-313).
+# Uso desde un repo:
+#   jobs:
+#     ci:
+#       uses: Lambda-Works/.github/.github/workflows/ci.yml@main
+#       with: { node-version: "22" }
+name: CI compartido (copia)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Version de Node
+        type: string
+        default: "22"
+      working-directory:
+        description: Carpeta del proyecto (donde esta el lockfile)
+        type: string
+        default: "."
+      lint-command:
+        description: Comando de lint (vacio = script "lint" si existe)
+        type: string
+        default: ""
+      typecheck-command:
+        description: Comando de typecheck (vacio = script "typecheck" o "type-check" si existe)
+        type: string
+        default: ""
+      build-command:
+        description: Comando de build (vacio = script "build" si existe)
+        type: string
+        default: ""
+      test-command:
+        description: Comando de test (vacio = script "test" si existe)
+        type: string
+        default: ""
+      non-blocking:
+        description: Pasos que no bloquean, separados por coma (lint,typecheck,build,test,install)
+        type: string
+        default: ""
+      only-gitleaks:
+        description: Solo correr gitleaks (repos con CI propio)
+        type: boolean
+        default: false
+      pre-build-command:
+        description: Comando opcional antes de typecheck/build (por ejemplo prisma generate)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Instalar gitleaks (version fija)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gl.tgz
+          curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" -o gl.sum
+          grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gl.sum | sed 's# .*# gl.tgz#' | sha256sum -c -
+          tar -xzf gl.tgz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Escanear secretos en el diff del PR
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$base" ]; then
+            gitleaks git --redact --verbose --log-opts="${base}..${head}" .
+          else
+            gitleaks git --redact --verbose .
+          fi
+
+  ci:
+    name: lint / typecheck / build / test
+    if: ${{ !inputs.only-gitleaks }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detectar gestor de paquetes y scripts
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm; lock=pnpm-lock.yaml
+          elif [ -f yarn.lock ]; then pm=yarn; lock=yarn.lock
+          elif [ -f package-lock.json ]; then pm=npm; lock=package-lock.json
+          else echo "::error::No hay lockfile (pnpm-lock.yaml, yarn.lock o package-lock.json) en ${{ inputs.working-directory }}"; exit 1; fi
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+          echo "lock=$lock" >> "$GITHUB_OUTPUT"
+          if [ "$pm" = pnpm ]; then
+            if node -e 'process.exit(require("./package.json").packageManager?0:1)' 2>/dev/null; then echo "pnpm_version=" >> "$GITHUB_OUTPUT"
+            else
+              lv=$(head -1 pnpm-lock.yaml | tr -d "'\"" | sed 's/lockfileVersion: //')
+              case "$lv" in 5*) v=7;; 6*) v=8;; *) v=9;; esac
+              echo "pnpm_version=$v" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          # Scripts presentes en la raiz o en workspaces
+          node - <<'JS' >> "$GITHUB_OUTPUT"
+          const fs = require('fs'), path = require('path');
+          const rootPkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          let globs = [];
+          const ws = rootPkg.workspaces;
+          if (Array.isArray(ws)) globs = ws; else if (ws && ws.packages) globs = ws.packages;
+          if (fs.existsSync('pnpm-workspace.yaml')) {
+            for (const m of fs.readFileSync('pnpm-workspace.yaml', 'utf8').matchAll(/^\s*-\s*['"]?([^'"\n#]+?)['"]?\s*$/gm)) globs.push(m[1]);
+          }
+          const dirs = [];
+          for (const g of globs) {
+            if (g.startsWith('!')) continue;
+            const parts = g.replace(/\/$/, '').split('/');
+            if (parts[parts.length - 1] === '*' || parts[parts.length - 1] === '**') {
+              const base = parts.slice(0, -1).join('/');
+              if (fs.existsSync(base)) for (const d of fs.readdirSync(base)) dirs.push(path.join(base, d));
+            } else dirs.push(g);
+          }
+          const pkgs = [rootPkg];
+          const wsHas = {};
+          for (const d of dirs) {
+            const f = path.join(d, 'package.json');
+            if (fs.existsSync(f)) pkgs.push(JSON.parse(fs.readFileSync(f, 'utf8')));
+          }
+          const has = (name, list) => pkgs.some(p => p.scripts && list.includes(p.scripts[name] ? name : ''));
+          const rootHas = n => !!(rootPkg.scripts && rootPkg.scripts[n]);
+          const anyHas = n => pkgs.some(p => p.scripts && p.scripts[n]);
+          const out = {
+            lint: ['lint'], typecheck: ['typecheck', 'type-check'], build: ['build'], test: ['test']
+          };
+          for (const [k, names] of Object.entries(out)) {
+            const rn = names.find(rootHas);
+            const wn = names.find(anyHas);
+            console.log(`${k}_root=${rn || ''}`);
+            console.log(`${k}_any=${wn || ''}`);
+          }
+          console.log(`is_workspace=${dirs.length > 0}`);
+          JS
+
+      - name: Instalar pnpm
+        if: steps.detect.outputs.pm == 'pnpm'
+        run: |
+          if [ -n "${{ steps.detect.outputs.pnpm_version }}" ]; then npm install -g "pnpm@${{ steps.detect.outputs.pnpm_version }}"
+          else corepack enable; fi
+          pnpm --version
+      - name: Activar corepack (yarn)
+        if: steps.detect.outputs.pm == 'yarn'
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ steps.detect.outputs.pm }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ steps.detect.outputs.lock }}
+
+      - name: Instalar dependencias
+        continue-on-error: ${{ contains(inputs.non-blocking, 'install') }}
+        run: |
+          case "${{ steps.detect.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --immutable 2>/dev/null || yarn install --frozen-lockfile ;;
+            npm)  npm ci ;;
+          esac
+
+      - name: Comando previo
+        if: ${{ inputs.pre-build-command != '' }}
+        run: ${{ inputs.pre-build-command }}
+
+      # Cada paso corre el comando explicito si se paso; si no, el script de package.json
+      # (raiz, o en todos los workspaces que lo tengan). Si no existe, se saltea.
+      - name: Lint
+        continue-on-error: ${{ contains(inputs.non-blocking, 'lint') }}
+        env: { PM: "${{ steps.detect.outputs.pm }}", CMD: "${{ inputs.lint-command }}", ROOT: "${{ steps.detect.outputs.lint_root }}", ANY: "${{ steps.detect.outputs.lint_any }}", WS: "${{ steps.detect.outputs.is_workspace }}" }
+        run: |
+          set -euo pipefail
+          if [ -n "$CMD" ]; then bash -c "$CMD"
+          elif [ -n "$ROOT" ]; then $PM run "$ROOT"
+          elif [ -n "$ANY" ] && [ "$WS" = true ]; then
+            case "$PM" in pnpm) pnpm -r --if-present run "$ANY";; npm) npm run "$ANY" --workspaces --if-present;; yarn) yarn workspaces run "$ANY";; esac
+          else echo "Sin script de lint, se saltea"; fi
+
+      - name: Typecheck
+        continue-on-error: ${{ contains(inputs.non-blocking, 'typecheck') }}
+        env: { PM: "${{ steps.detect.outputs.pm }}", CMD: "${{ inputs.typecheck-command }}", ROOT: "${{ steps.detect.outputs.typecheck_root }}", ANY: "${{ steps.detect.outputs.typecheck_any }}", WS: "${{ steps.detect.outputs.is_workspace }}" }
+        run: |
+          set -euo pipefail
+          if [ -n "$CMD" ]; then bash -c "$CMD"
+          elif [ -n "$ROOT" ]; then $PM run "$ROOT"
+          elif [ -n "$ANY" ] && [ "$WS" = true ]; then
+            case "$PM" in pnpm) pnpm -r --if-present run "$ANY";; npm) npm run "$ANY" --workspaces --if-present;; yarn) yarn workspaces run "$ANY";; esac
+          else echo "Sin script de typecheck, se saltea"; fi
+
+      - name: Build
+        continue-on-error: ${{ contains(inputs.non-blocking, 'build') }}
+        env: { PM: "${{ steps.detect.outputs.pm }}", CMD: "${{ inputs.build-command }}", ROOT: "${{ steps.detect.outputs.build_root }}", ANY: "${{ steps.detect.outputs.build_any }}", WS: "${{ steps.detect.outputs.is_workspace }}" }
+        run: |
+          set -euo pipefail
+          if [ -n "$CMD" ]; then bash -c "$CMD"
+          elif [ -n "$ROOT" ]; then $PM run "$ROOT"
+          elif [ -n "$ANY" ] && [ "$WS" = true ]; then
+            case "$PM" in pnpm) pnpm -r --if-present run "$ANY";; npm) npm run "$ANY" --workspaces --if-present;; yarn) yarn workspaces run "$ANY";; esac
+          else echo "Sin script de build, se saltea"; fi
+
+      - name: Test
+        continue-on-error: ${{ contains(inputs.non-blocking, 'test') }}
+        env: { PM: "${{ steps.detect.outputs.pm }}", CMD: "${{ inputs.test-command }}", ROOT: "${{ steps.detect.outputs.test_root }}", ANY: "${{ steps.detect.outputs.test_any }}", WS: "${{ steps.detect.outputs.is_workspace }}", CI: "true" }
+        run: |
+          set -euo pipefail
+          if [ -n "$CMD" ]; then bash -c "$CMD"
+          elif [ -n "$ROOT" ]; then $PM run "$ROOT"
+          elif [ -n "$ANY" ] && [ "$WS" = true ]; then
+            case "$PM" in pnpm) pnpm -r --if-present run "$ANY";; npm) npm run "$ANY" --workspaces --if-present;; yarn) yarn workspaces run "$ANY";; esac
+          else echo "Sin script de test, se saltea"; fi
